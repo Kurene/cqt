@@ -11,8 +11,9 @@ References:
     7th Sound and Music Computing Conference, Barcelona, Spain. 2010.
 """
 import numpy as np
+from numba import jit
 from scipy.signal import butter, lfilter, bessel, filtfilt
-
+import resampy
         
 class RDCQT():
     def __init__(self, 
@@ -22,7 +23,7 @@ class RDCQT():
         f0=55/2,            # lowest center frequency
         window=np.hanning,  # window func.
         lpf_order=6,        # order of lowpass filter using recursive downsampling
-        hop_length=128,
+        hop_length=256,
         winlenmax=None,
         q_rate=1.0,
         sp_thresh=0.0,
@@ -145,7 +146,65 @@ class RDCQT():
 
         return self.y[:]
 
+
+    def stcqt_batch(self, x):
+        n_frames = len(x) // self.hop_length
+        
+        n_x_adjust = 2 ** (self.n_octave-1)
+        n_pad = n_x_adjust - (len(x) + self.n_fft) % n_x_adjust
+        len_x = len(x) + self.n_fft + n_pad
+
+        # 1. recursive downsampling
+        xd_raw = np.zeros((self.n_octave, len_x))
+        tmp_x  = np.zeros(len_x)
+        xd_raw[0, 0:len(x)] = x[:]
+        for k in range(1, self.n_octave):
+            idx1 = len_x  // 2 ** (k-1)
+            idx2 = idx1 // 2
+            tmp_x[0:idx1]     = filtfilt(self.lpf_b, self.lpf_a, xd_raw[k-1, 0:idx1]) #lfilter
+            xd_raw[k, 0:idx2] = tmp_x[0:idx1][::2]
+            #xd_raw[k, 0:idx2] =  resampy.resample(xd_raw[k-1, 0:idx1], self.sr/ 2**(k-1), self.sr/ 2**k, filter='kaiser_fast')
+           
+        # 2. make xd
+        xd     = np.zeros((self.n_octave, n_frames, self.n_fft_1oct))
+        _batch_make_xd(xd_raw, xd, 
+                       self.n_octave, self.n_bpo, n_frames,
+                       self.n_fft, self.n_fft_1oct, self.hop_length)
+        del xd_raw, tmp_x 
+                          
+        # 3. calc. cqt-spec using spectral kernel by each octave
+        spec = np.zeros([self.n_pitch, n_frames], dtype=np.complex128)
+        xd_fft = np.zeros(self.n_fft_1oct, dtype=np.complex128)
+        
+        for k in range(0, self.n_octave):  
+            st = self.n_bpo * (self.n_octave-k-1)           
+            en = st + self.n_bpo
             
+            for n in range(n_frames):
+                xd_fft[:] = np.fft.fft(xd[k, n, :]) 
+                spec[st:en, n] = np.dot(self.spectral_kernel, xd_fft)
+                
+        return spec
+
+
+@jit('void(f8[:,:], f8[:,:,:], i8, i8, i8, i8, i8, i8)', nopython=True, nogil=True)
+def _batch_make_xd(
+        xd_raw, xd, 
+        n_octave, n_bpo, n_frames,
+        n_fft, n_fft_1oct, hop_length,
+    ):
+       
+    for k in range(0, n_octave): 
+        center_init = n_fft // 2 ** (k + 1)
+        hop_length_ds = hop_length // 2 ** k
+        
+        for n in range(n_frames):
+            center = center_init + n * hop_length_ds
+            st = center - n_fft_1oct//2
+            en = center + n_fft_1oct//2
+            xd[k, n, :] = xd_raw[k, st:en]
+
+
 def _rdcqt(spectral_kernel, 
          xd_fft, 
          x_list, tmp_x, y,
@@ -205,39 +264,98 @@ if __name__ == "__main__":
     import sys
     import time
     import librosa
+    import timeit
     import matplotlib.pyplot as plt
     from cqt import CQT
     
     
     sr = 44100
-    y, sr = librosa.load(sys.argv[1], sr=sr, mono=True)
-    
+    duration = int(sys.argv[2])
+    y, sr = librosa.load(sys.argv[1], sr=sr, mono=True, duration=duration)#, offset=52, duration=11)
+    np.set_printoptions(precision=3)
+    #methods =  ["RT_CQTwoSP", "RT_CQTwSP", "RT_RDCQT", "LibROSA_CQT", "LibROSA_STFT"]
+    methods =  ["RT_RDCQT", "RT_RDCQT_batch","LibROSA_CQT"]
+    n_methods = len(methods)
+
+    # ============================================
+    """
     rdcqt     = RDCQT(sr)
-    cqt       = CQT(sr, sparse_computation=True)
-    
+ 
     start_time = time.time()
-    spec_cqt = cqt.stcqt(y)
-    print(f"proctime: {time.time() - start_time:1.3f}")
-    
+    spec2 = rdcqt.stcqt_batch(y)
+    print(f"proctime: {time.time() - start_time:1.3f}") 
     start_time = time.time()
-    spec_rdcqt = rdcqt.stcqt(y)
+    spec1 = rdcqt.stcqt(y)
     print(f"proctime: {time.time() - start_time:1.3f}")
-    
-    amplitude_to_db = lambda x : np.sqrt(x)/np.max(np.sqrt(x)) #librosa.amplitude_to_db(x, ref=np.max)
+
     
     plt.clf()
     plt.subplot(1,2,1)
-    plt.imshow(amplitude_to_db(np.abs(spec_cqt)),  origin="lower", aspect="auto", cmap="jet")
+    plt.imshow(np.abs(spec1), origin="lower", aspect="auto", cmap="jet")
     plt.colorbar()
-    plt.title("CQT: Sparse matrix computation")
     plt.subplot(1,2,2)
-    plt.imshow(amplitude_to_db(np.abs(spec_rdcqt)), origin="lower", aspect="auto", cmap="jet")
-    plt.title("CQT: Recursive downsampling method")
+    plt.imshow(np.abs(spec2), origin="lower", aspect="auto", cmap="jet")
     plt.colorbar()
-    
-    plt.tight_layout()
     plt.show()  
+    """
+    def comparison(
+        n_loop          = 3,
+        fmin            = 55/2,
+        bins_per_octave = 12,
+        n_octave        = 8,
+        hop_length      = 256,
+    ):
+        rdcqt     = RDCQT(sr, f0=fmin, n_bpo=bins_per_octave, n_octave=n_octave, hop_length=hop_length)
+        cqt       = CQT(sr, sparse_computation=True, f0=fmin, n_bpo=bins_per_octave, n_octave=n_octave, hop_length=hop_length)
+        idx = 0
+        time_array = np.zeros((n_methods, n_loop))
+        
+        for k in range(n_loop):
+            start_time = time.time()
+            rdcqt.stcqt(y)
+            time_array[idx,k] = time.time() - start_time
+        print(f"{methods[idx]}:        \t{np.mean(time_array[idx]):1.3f}")
+        idx += 1
 
+        for k in range(n_loop):
+            start_time = time.time()
+            rdcqt.stcqt_batch(y)
+            time_array[idx,k] = time.time() - start_time
+        print(f"{methods[idx]}:        \t{np.mean(time_array[idx]):1.3f}")
+        idx += 1
+
+        for k in range(n_loop):
+            start_time = time.time()
+            librosa.cqt(y, sr=sr, hop_length=hop_length, fmin=fmin, 
+                n_bins=n_octave*bins_per_octave, bins_per_octave=bins_per_octave)
+            time_array[idx,k] = time.time() - start_time
+        print(f"{methods[idx]}:        \t{np.mean(time_array[idx]):1.3f}")
+        idx += 1
+
+        np.savetxt(f"cqt_{duration}_bpo{bins_per_octave}_{n_octave}_fmin{int(fmin)}.csv", time_array, delimiter=",")
+
+        for m in range(n_methods):
+            print(methods[m], end="\t")
+            for k in range(n_loop):
+                print(time_array[m,k], end="\t")
+            print("\n")
+   
+    comparison(
+        n_loop          = 5,
+        fmin            = 55/2,
+        bins_per_octave = 12,
+        n_octave        = 8,
+        hop_length      = 256,
+    )
+    
+    comparison(
+        n_loop          = 5,
+        fmin            = 55/2,
+        bins_per_octave = 24,
+        n_octave        = 8,
+        hop_length      = 256,
+    )
+        
     import code
     console = code.InteractiveConsole(locals=locals())
     console.interact()
